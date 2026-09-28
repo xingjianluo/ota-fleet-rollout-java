@@ -29,6 +29,15 @@ public class OtaProperties {
     /** 默认每批设备数。 */
     private int batchSize = 10;
 
+    /** 批次达标判定方式：COUNT 固定台数（历史默认）/ RATIO 成功比例。 */
+    private String batchSuccessMode = "COUNT";
+
+    /** RATIO 模式下当前批达标所需的最小成功占比（0~1）。 */
+    private double batchSuccessRatio = 1.0d;
+
+    /** 每台设备最大尝试次数（首次 + 重试）；&lt;=0 表示不限制（历史默认）。 */
+    private int maxAttemptsPerDevice = 0;
+
     public long getOfflineThresholdMs() {
         return offlineThresholdMs;
     }
@@ -59,5 +68,29 @@ public class OtaProperties {
 
     public void setBatchSize(int batchSize) {
         this.batchSize = batchSize;
+    }
+
+    public String getBatchSuccessMode() {
+        return batchSuccessMode;
+    }
+
+    public void setBatchSuccessMode(String batchSuccessMode) {
+        this.batchSuccessMode = batchSuccessMode;
+    }
+
+    public double getBatchSuccessRatio() {
+        return batchSuccessRatio;
+    }
+
+    public void setBatchSuccessRatio(double batchSuccessRatio) {
+        this.batchSuccessRatio = batchSuccessRatio;
+    }
+
+    public int getMaxAttemptsPerDevice() {
+        return maxAttemptsPerDevice;
+    }
+
+    public void setMaxAttemptsPerDevice(int maxAttemptsPerDevice) {
+        this.maxAttemptsPerDevice = maxAttemptsPerDevice;
     }
 }

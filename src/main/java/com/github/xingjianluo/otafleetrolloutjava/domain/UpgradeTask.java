@@ -33,6 +33,15 @@ public class UpgradeTask {
     /** 允许的最大失败率（0~1），超过则暂停任务。 */
     private final double maxFailureRate;
 
+    /** 批次达标判定方式：固定台数 / 成功比例。 */
+    private final BatchSuccessMode batchSuccessMode;
+
+    /** 比例模式下当前批达标所需的最小成功占比（0~1）。 */
+    private final double batchSuccessRatio;
+
+    /** 每台设备的最大尝试次数（首次上报 + 重试）；&lt;=0 表示不限制（历史行为）。 */
+    private final int maxAttemptsPerDevice;
+
     /** batches.get(i) 为第 i 批的设备记录（按设备 id 索引）。 */
     private final List<Map<String, DeviceUpgradeRecord>> batches = new ArrayList<>();
 
@@ -44,10 +53,21 @@ public class UpgradeTask {
 
     public UpgradeTask(String taskId, String targetVersion,
                        int successThreshold, double maxFailureRate) {
+        this(taskId, targetVersion, successThreshold, maxFailureRate,
+                BatchSuccessMode.COUNT, 1.0d, 0);
+    }
+
+    public UpgradeTask(String taskId, String targetVersion,
+                       int successThreshold, double maxFailureRate,
+                       BatchSuccessMode batchSuccessMode, double batchSuccessRatio,
+                       int maxAttemptsPerDevice) {
         this.taskId = taskId;
         this.targetVersion = targetVersion;
         this.successThreshold = successThreshold;
         this.maxFailureRate = maxFailureRate;
+        this.batchSuccessMode = batchSuccessMode;
+        this.batchSuccessRatio = batchSuccessRatio;
+        this.maxAttemptsPerDevice = maxAttemptsPerDevice;
     }
 
     public String getTaskId() {
@@ -64,6 +84,18 @@ public class UpgradeTask {
 
     public double getMaxFailureRate() {
         return maxFailureRate;
+    }
+
+    public BatchSuccessMode getBatchSuccessMode() {
+        return batchSuccessMode;
+    }
+
+    public double getBatchSuccessRatio() {
+        return batchSuccessRatio;
+    }
+
+    public int getMaxAttemptsPerDevice() {
+        return maxAttemptsPerDevice;
     }
 
     public int getCurrentBatchIndex() {
@@ -127,9 +159,50 @@ public class UpgradeTask {
                 .count();
     }
 
+    /** 当前批次成功设备占比（0~1）；批次为空时返回 0。 */
+    public double currentBatchSuccessRatio() {
+        Map<String, DeviceUpgradeRecord> batch = currentBatch();
+        if (batch.isEmpty()) {
+            return 0d;
+        }
+        return (double) currentBatchSuccessCount() / batch.size();
+    }
+
     /** 当前批次是否达到成功阈值，允许推进。 */
     public boolean currentBatchThresholdReached() {
+        if (currentBatch().isEmpty()) {
+            return false;
+        }
+        if (batchSuccessMode == BatchSuccessMode.RATIO) {
+            // 按当前批设备总数计占比：尾巴批次设备较少时，只要成功占比达标即可通过
+            return currentBatchSuccessRatio() >= batchSuccessRatio;
+        }
+        // 历史行为：按固定成功台数判定
         return currentBatchSuccessCount() >= successThreshold;
+    }
+
+    /**
+     * 进入中止回滚瞬态：仅 RUNNING/PAUSED 可中止，COMPLETED/已中止均拒绝（中止幂等）。
+     */
+    public boolean beginAbort() {
+        if (status == TaskStatus.RUNNING || status == TaskStatus.PAUSED) {
+            status = TaskStatus.ABORTING;
+            pauseReason = null;
+            return true;
+        }
+        return false;
+    }
+
+    /** 中止回滚全部落库后，任务置为终态 ABORTED。 */
+    public void finishAbort() {
+        if (status == TaskStatus.ABORTING) {
+            status = TaskStatus.ABORTED;
+        }
+    }
+
+    /** 该任务是否已进入中止流程（ABORTING/ABORTED）。 */
+    public boolean isAbortingOrAborted() {
+        return status == TaskStatus.ABORTING || status == TaskStatus.ABORTED;
     }
 
     /**
@@ -148,7 +221,8 @@ public class UpgradeTask {
         // 已是最后一批且达标：仅当本批不存在未决设备时才可完成
         boolean allTerminal = currentBatch().values().stream()
                 .allMatch(r -> r.getState() == DeviceUpgradeState.SUCCESS
-                        || r.getState() == DeviceUpgradeState.ROLLED_BACK);
+                        || r.getState() == DeviceUpgradeState.ROLLED_BACK
+                        || r.getState() == DeviceUpgradeState.SKIPPED);
         if (allTerminal) {
             status = TaskStatus.COMPLETED;
             return true;

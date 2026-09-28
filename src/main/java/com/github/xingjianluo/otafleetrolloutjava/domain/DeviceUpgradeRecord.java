@@ -35,6 +35,9 @@ public class DeviceUpgradeRecord {
     /** 已尝试次数（重试会递增），用于观测与审计。 */
     private volatile int attempts;
 
+    /** 转为 ROLLED_BACK 的原因（重试上限自动回滚 / 整任务中止），可追溯。 */
+    private volatile String rollbackReason;
+
     public DeviceUpgradeRecord(String deviceId, String taskId, int batchIndex,
                                String targetVersion, String previousVersion) {
         this.deviceId = deviceId;
@@ -74,6 +77,10 @@ public class DeviceUpgradeRecord {
 
     public int getAttempts() {
         return attempts;
+    }
+
+    public String getRollbackReason() {
+        return rollbackReason;
     }
 
     /**
@@ -117,10 +124,47 @@ public class DeviceUpgradeRecord {
      * 回滚：FAILED -> ROLLED_BACK（终态）。
      */
     public boolean markRolledBack() {
+        return markRolledBackWithReason(null);
+    }
+
+    /**
+     * 回滚：FAILED -> ROLLED_BACK（终态），并记录回滚原因（可追溯）。
+     *
+     * @param reason 回滚原因（如重试上限自动回滚）；null 表示人工回滚
+     */
+    public boolean markRolledBackWithReason(String reason) {
         if (state != DeviceUpgradeState.FAILED) {
             return false;
         }
         state = DeviceUpgradeState.ROLLED_BACK;
+        this.rollbackReason = reason;
+        return true;
+    }
+
+    /**
+     * 整任务中止时，已成功设备随任务回滚：SUCCESS -> ROLLED_BACK（终态），
+     * 生效版本由编排层恢复为 previousVersion。重复中止幂等：仅 SUCCESS 可迁移。
+     *
+     * @param reason 回滚原因（整任务中止），可追溯
+     */
+    public boolean markRolledBackFromSuccess(String reason) {
+        if (state != DeviceUpgradeState.SUCCESS) {
+            return false;
+        }
+        state = DeviceUpgradeState.ROLLED_BACK;
+        this.rollbackReason = reason;
+        return true;
+    }
+
+    /**
+     * 整任务中止时，尚未升级的设备：PENDING -> SKIPPED（终态），
+     * 不做任何版本变更，设备保持升级前版本。重复中止幂等。
+     */
+    public boolean markSkipped() {
+        if (state != DeviceUpgradeState.PENDING) {
+            return false;
+        }
+        state = DeviceUpgradeState.SKIPPED;
         return true;
     }
 

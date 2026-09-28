@@ -1,6 +1,7 @@
 package com.github.xingjianluo.otafleetrolloutjava.service;
 
 import com.github.xingjianluo.otafleetrolloutjava.config.OtaProperties;
+import com.github.xingjianluo.otafleetrolloutjava.domain.BatchSuccessMode;
 import com.github.xingjianluo.otafleetrolloutjava.domain.Device;
 import com.github.xingjianluo.otafleetrolloutjava.domain.DeviceUpgradeRecord;
 import com.github.xingjianluo.otafleetrolloutjava.domain.DeviceUpgradeState;
@@ -43,6 +44,8 @@ public class RolloutService {
         REJECTED_BATCH_NOT_STARTED,
         /** 任务已暂停，需先处理失败设备。 */
         REJECTED_TASK_PAUSED,
+        /** 任务已中止/正在中止回滚，上报不再接受。 */
+        REJECTED_TASK_ABORTED,
         /** 任务或设备记录不存在。 */
         REJECTED_UNKNOWN
     }
@@ -60,14 +63,40 @@ public class RolloutService {
      * 创建升级任务（幂等：taskId 已存在时返回既有任务，重复创建命令安全）。
      * 设备按 batchSize 顺序切分为若干批次。
      */
+    /**
+     * 固定台数判定的便捷重载（历史签名，行为不变：COUNT 模式、不限制重试次数）。
+     */
     public UpgradeTask createTask(String taskId, String targetVersion, List<String> deviceIds,
                                   int batchSize, int successThreshold, double maxFailureRate) {
+        return createTask(taskId, targetVersion, deviceIds, batchSize, successThreshold, maxFailureRate,
+                BatchSuccessMode.COUNT, 1.0d, 0);
+    }
+
+    /** 使用配置默认值创建任务。 */
+    public UpgradeTask createTask(String taskId, String targetVersion, List<String> deviceIds) {
+        return createTask(taskId, targetVersion, deviceIds,
+                properties.getBatchSize(),
+                properties.getBatchSuccessThreshold(),
+                properties.getMaxFailureRate(),
+                BatchSuccessMode.valueOf(properties.getBatchSuccessMode()),
+                properties.getBatchSuccessRatio(),
+                properties.getMaxAttemptsPerDevice());
+    }
+
+    /**
+     * 全参创建任务。设备按 batchSize 顺序切批；批次达标方式由 batchSuccessMode 决定。
+     */
+    public UpgradeTask createTask(String taskId, String targetVersion, List<String> deviceIds,
+                                  int batchSize, int successThreshold, double maxFailureRate,
+                                  BatchSuccessMode batchSuccessMode,
+                                  double batchSuccessRatio, int maxAttemptsPerDevice) {
         return tasks.compute(taskId, (id, existing) -> {
             if (existing != null) {
                 log.info("[createTask] 重复创建被忽略: taskId={}, 保持既有任务 {}", id, existing);
                 return existing;
             }
-            UpgradeTask task = new UpgradeTask(id, targetVersion, successThreshold, maxFailureRate);
+            UpgradeTask task = new UpgradeTask(id, targetVersion, successThreshold, maxFailureRate,
+                    batchSuccessMode, batchSuccessRatio, maxAttemptsPerDevice);
             List<DeviceUpgradeRecord> batch = new ArrayList<>();
             int batchIndex = 0;
             for (String deviceId : deviceIds) {
@@ -85,19 +114,11 @@ public class RolloutService {
                 task.addBatch(batch);
             }
             log.info("[createTask] 任务创建: taskId={}, targetVersion={}, 设备数={}, 批次数={}, "
-                            + "successThreshold={}, maxFailureRate={}",
+                            + "successThreshold={}, maxFailureRate={}, batchSuccessMode={}, batchSuccessRatio={}, maxAttemptsPerDevice={}",
                     id, targetVersion, deviceIds.size(), task.getBatchCount(),
-                    successThreshold, maxFailureRate);
+                    successThreshold, maxFailureRate, batchSuccessMode, batchSuccessRatio, maxAttemptsPerDevice);
             return task;
         });
-    }
-
-    /** 使用配置默认值创建任务。 */
-    public UpgradeTask createTask(String taskId, String targetVersion, List<String> deviceIds) {
-        return createTask(taskId, targetVersion, deviceIds,
-                properties.getBatchSize(),
-                properties.getBatchSuccessThreshold(),
-                properties.getMaxFailureRate());
     }
 
     /**
@@ -106,10 +127,12 @@ public class RolloutService {
      * <p>判定依据（按序）：</p>
      * <ol>
      *   <li>任务/记录不存在 -> REJECTED_UNKNOWN；</li>
+     *   <li>任务已中止/正在中止回滚 -> REJECTED_TASK_ABORTED（中止期间上报与回滚串行，结果唯一）；</li>
      *   <li>任务已暂停 -> REJECTED_TASK_PAUSED（先重试或回滚失败设备）；</li>
      *   <li>记录已终态 -> DUPLICATE_IGNORED（不重复计数）；</li>
      *   <li>记录所在批次晚于当前批 -> REJECTED_BATCH_NOT_STARTED（防跳批）；</li>
-     *   <li>否则接受：成功则推进设备生效版本到目标版本，失败则记录原因；
+     *   <li>否则接受：成功则推进设备生效版本到目标版本，失败则记录原因，
+     *       且当失败已达该设备尝试次数上限时直接自动回滚；
      *       随后检查失败率（超限暂停）与批次阈值（达标自动推进）。</li>
      * </ol>
      */
@@ -125,6 +148,12 @@ public class RolloutService {
             if (record == null) {
                 log.warn("[report] 设备不在任务中: taskId={}, deviceId={}", id, deviceId);
                 outcome[0] = ReportOutcome.REJECTED_UNKNOWN;
+                return task;
+            }
+            if (task.isAbortingOrAborted()) {
+                log.info("[report] 任务已中止, 上报被拒绝: taskId={}, deviceId={}, taskStatus={}",
+                        id, deviceId, task.getStatus());
+                outcome[0] = ReportOutcome.REJECTED_TASK_ABORTED;
                 return task;
             }
             if (task.getStatus() == TaskStatus.PAUSED) {
@@ -153,8 +182,21 @@ public class RolloutService {
                 outcome[0] = ReportOutcome.ACCEPTED_SUCCESS;
             } else {
                 record.markFailed(failReason);
-                log.info("[report] 升级失败: taskId={}, deviceId={}, 原因={}", id, deviceId, failReason);
+                log.info("[report] 升级失败: taskId={}, deviceId={}, attempts={}/{}, 原因={}",
+                        id, deviceId, record.getAttempts(), task.getMaxAttemptsPerDevice(), failReason);
                 outcome[0] = ReportOutcome.ACCEPTED_FAILURE;
+                // 达到每设备尝试次数上限：不再允许重试，直接自动回滚到升级前版本
+                if (task.getMaxAttemptsPerDevice() > 0
+                        && record.getAttempts() >= task.getMaxAttemptsPerDevice()
+                        && record.markRolledBackWithReason(
+                                "retry-limit-exceeded: attempts=" + record.getAttempts()
+                                        + "/" + task.getMaxAttemptsPerDevice()
+                                        + ", lastFailReason=" + failReason)) {
+                    deviceRegistry.updateEffectiveVersion(deviceId, record.getPreviousVersion());
+                    log.warn("[report] 失败已达尝试上限, 自动回滚: taskId={}, deviceId={}, attempts={}/{}, 生效版本恢复为 {}",
+                            id, deviceId, record.getAttempts(), task.getMaxAttemptsPerDevice(),
+                            record.getPreviousVersion());
+                }
             }
             settle(taskId, task);
             return task;
@@ -180,8 +222,14 @@ public class RolloutService {
         boolean[] advanced = new boolean[1];
         tasks.computeIfPresent(taskId, (id, task) -> {
             advanced[0] = task.advanceBatch();
-            log.info("[advance] taskId={}, 判定依据: currentBatchSuccess={} >= threshold={} -> {}, 任务状态={}",
-                    id, task.currentBatchSuccessCount(), task.getSuccessThreshold(),
+
+            String criterion = task.getBatchSuccessMode() == BatchSuccessMode.RATIO
+                    ? "成功占比=" + task.currentBatchSuccessCount() + "/" + task.currentBatch().size()
+                        + "(" + String.format("%.4f", task.currentBatchSuccessRatio())
+                        + ") >= ratio=" + task.getBatchSuccessRatio()
+                    : "成功台数=" + task.currentBatchSuccessCount() + " >= threshold=" + task.getSuccessThreshold();
+            log.info("[advance] taskId={}, 判定依据[{}]: {} -> {}, 任务状态={}",
+                    id, task.getBatchSuccessMode(), criterion,
                     advanced[0] ? "推进" : "保持", task.getStatus());
             return task;
         });
@@ -191,19 +239,33 @@ public class RolloutService {
     /**
      * 重试失败设备：FAILED -> PENDING，允许设备重新上报。
      * 失败记录清零后若任务处于暂停则自动恢复。
+     *
+     * <p>重试上限：任务配置了 maxAttemptsPerDevice 且该设备 attempts 已达上限时
+     * （失败上报时本应已自动回滚），重试被拒绝，避免突破上限无限重试。</p>
      */
     public boolean retryDevice(String taskId, String deviceId) {
         boolean[] retried = new boolean[1];
         tasks.computeIfPresent(taskId, (id, task) -> {
             DeviceUpgradeRecord record = task.findRecord(deviceId);
-            if (record != null && record.resetForRetry()) {
+            if (record == null) {
+                log.info("[retry] 无需重试(无记录): taskId={}, deviceId={}", id, deviceId);
+                return task;
+            }
+            if (task.getMaxAttemptsPerDevice() > 0
+                    && record.getAttempts() >= task.getMaxAttemptsPerDevice()
+                    && record.getState() == DeviceUpgradeState.FAILED) {
+                log.warn("[retry] 重试被拒绝(已达尝试上限): taskId={}, deviceId={}, attempts={}/{}",
+                        id, deviceId, record.getAttempts(), task.getMaxAttemptsPerDevice());
+                return task;
+            }
+            if (record.resetForRetry()) {
                 retried[0] = true;
                 log.info("[retry] 失败设备重置为PENDING: taskId={}, deviceId={}, attempts={}",
                         id, deviceId, record.getAttempts());
                 resumeIfResolved(task);
             } else {
                 log.info("[retry] 无需重试(非FAILED状态): taskId={}, deviceId={}, 状态={}",
-                        id, deviceId, record == null ? "无记录" : record.getState());
+                        id, deviceId, record.getState());
             }
             return task;
         });
@@ -283,6 +345,74 @@ public class RolloutService {
 
     public Optional<UpgradeTask> findTask(String taskId) {
         return Optional.ofNullable(tasks.get(taskId));
+    }
+
+    /**
+     * 一键中止整个任务并全量回滚。整个过程在任务级锁内原子完成：
+     * <ul>
+     *   <li>RUNNING/PAUSED -> ABORTING -> ABORTED（终态，幂等：重复中止返回 false）；</li>
+     *   <li>已升级成功（SUCCESS）的设备：状态 -> ROLLED_BACK，生效版本恢复为各自升级前版本；</li>
+     *   <li>当前失败（FAILED）的设备：状态 -> ROLLED_BACK，生效版本恢复为升级前版本；</li>
+     *   <li>尚未升级（PENDING）的设备：状态 -> SKIPPED，版本保持原样、不再升级；</li>
+     *   <li>与设备上报并发时：二者经同一把任务锁串行。若中止先发生，上报被
+     *       {@code REJECTED_TASK_ABORTED} 拒绝且版本不动；若上报先发生（设备已成功），
+     *       中止会把它回滚。最终结果唯一确定，不会版本错配或重复回滚。</li>
+     * </ul>
+     *
+     * @return true 表示本次调用真正执行了中止；false 表示任务不存在、已完成或已中止
+     */
+    public boolean abortTask(String taskId) {
+        boolean[] aborted = new boolean[1];
+        tasks.computeIfPresent(taskId, (id, task) -> {
+            if (!task.beginAbort()) {
+                log.info("[abort] 中止被忽略(任务非RUNNING/PAUSED或已中止): taskId={}, taskStatus={}",
+                        id, task.getStatus());
+                return task;
+            }
+            log.warn("[abort] 开始整任务中止回滚: taskId={}, targetVersion={}", id, task.getTargetVersion());
+            int rolledBack = 0;
+            int skipped = 0;
+            for (Map<String, DeviceUpgradeRecord> batch : task.getBatches()) {
+                for (DeviceUpgradeRecord record : batch.values()) {
+                    String deviceId = record.getDeviceId();
+                    if (record.markRolledBackFromSuccess("task-aborted: rollback to previous version")) {
+                        deviceRegistry.updateEffectiveVersion(deviceId, record.getPreviousVersion());
+                        rolledBack++;
+                        log.info("[abort] 已成功设备随任务回滚: taskId={}, deviceId={}, 生效版本恢复为 {}",
+                                id, deviceId, record.getPreviousVersion());
+                    } else if (record.markRolledBackWithReason(
+                            "task-aborted: failed device rollback to previous version")) {
+                        deviceRegistry.updateEffectiveVersion(deviceId, record.getPreviousVersion());
+                        rolledBack++;
+                        log.info("[abort] 失败设备随任务回滚: taskId={}, deviceId={}, 生效版本恢复为 {}",
+                                id, deviceId, record.getPreviousVersion());
+                    } else if (record.markSkipped()) {
+                        skipped++;
+                        log.info("[abort] 未升级设备保持原样: taskId={}, deviceId={}, 版本={}, 状态=SKIPPED",
+                                id, deviceId, record.getPreviousVersion());
+                    }
+                }
+            }
+            task.finishAbort();
+            aborted[0] = true;
+            log.warn("[abort] 整任务中止回滚完成: taskId={}, 回滚设备数={}, 跳过设备数={}, 任务状态={}",
+                    id, rolledBack, skipped, task.getStatus());
+            return task;
+        });
+        return aborted[0];
+    }
+
+    /**
+     * 在任务锁内快照读取任务，保证中止回滚期间查询不会观察到
+     * “新版本/旧版本混杂”或设备停在半路的瞬态（ABORTING 不会被锁外观察到）。
+     */
+    public Optional<UpgradeTask> getTaskConsistent(String taskId) {
+        Optional<UpgradeTask>[] result = new Optional[1];
+        tasks.computeIfPresent(taskId, (id, task) -> {
+            result[0] = Optional.of(task);
+            return task;
+        });
+        return result[0] == null ? Optional.empty() : result[0];
     }
 
     /** 上报/状态变更后的统一收尾：失败率超限则暂停，否则按阈值自动推进。 */
