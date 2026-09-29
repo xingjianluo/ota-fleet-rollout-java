@@ -40,18 +40,36 @@ FAILED  --回滚------> ROLLED_BACK   （终态，生效版本恢复为 previous
 
 ```
 RUNNING --失败率超限--> PAUSED   （pauseReason 汇总各设备失败原因，可追溯）
-PAUSED  --失败记录全部消解(重试/回滚)--> RUNNING （自动恢复）
-RUNNING --全部批次完成--> COMPLETED
+PAUSED  --失败记录全部消解(重试/回滚)--> RUNNING （自动恢复后立即重新收尾判定）
+RUNNING --全部批次达标且设备定性--> COMPLETED （终态，finishReason 记录收尾依据）
+RUNNING --当前批全部定性但成功不足--> FAILED   （终态，finishReason 记录收尾依据）
 ```
+
+`COMPLETED` 与 `FAILED` 均为**终态**：任务进入终态后状态不再变化，迟到的设备上报
+被拒绝（`REJECTED_TASK_FINISHED`），显式推进接口返回 false，因此多设备并发上报、
+重复上报或查询时看到的最终状态唯一且确定，不会出现“一会儿能过、一会儿过不了”的抖动。
 
 ## 批次推进规则
 
 - 设备按 `batchSize` 顺序切批，从第 0 批开始；
-- **仅当前批次成功台数 >= `successThreshold` 才允许进入下一批**（每次上报后自动检查，
-  也可调用显式推进接口，判定相同）；
+- **放行门槛（生效阈值）= min(`successThreshold`, 当前批实际设备数)**：
+  - 满批时门槛就是 `successThreshold`，与历史规则完全一致；
+  - 设备数不是每批台数整数倍时，最后一个**收尾批次**可能只有少量设备（例如每批 3 台、
+    阈值 2，投 4 台时收尾批只有 1 台）。若仍按原阈值 2 判定则永远不可能达标，任务会无限期
+    卡在 RUNNING；因此收尾批的门槛按其实际台数收敛（上例中收敛为 1，该设备成功即完成）；
+- 成功台数达到放行门槛才允许进入下一批（每次上报后自动检查，也可调用显式推进接口，判定相同）；
 - 设备所在批次晚于当前批时，其上报被拒绝（`REJECTED_BATCH_NOT_STARTED`），防止跳批；
 - 失败率 = `FAILED / (SUCCESS + FAILED)`，超过 `maxFailureRate` 任务立即暂停并保留原因；
-- 最后一批达标且全部设备到达终态（SUCCESS/ROLLED_BACK）后任务完成。
+- **收尾与完成语义**：每次上报以及失败设备被重试/回滚后，都在任务锁内执行同一次收尾判定——
+  - 当前批成功台数达标：非最后一批则推进；最后一批且设备全部定性（无 PENDING/FAILED 未决）
+    则任务 `COMPLETED`；
+  - 当前批成功台数未达标，但设备**已全部定性**（成功的 SUCCESS、失败的已回滚 ROLLED_BACK，
+    不存在还能改变结果的 PENDING/FAILED 记录）：这批结果已不可能再变化，任务明确收尾为
+    `FAILED` 终态，并在 `finishReason` 中记录“实际成功台数 / 门槛 / 批大小”，查询时一眼可辨；
+  - 仍有未决设备（PENDING 等待上报，或 FAILED 等待重试/回滚）时保持 RUNNING 继续等待。
+- 终态只迁移一次：重试只针对 FAILED 记录（记录变 PENDING 后该批重新存在未决设备，
+  自然不会被误判为收尾失败）；回滚把 FAILED 变为 ROLLED_BACK。所有判定均为幂等纯状态推导，
+  配合任务级锁，并发/重复上报下批次能否放行、任务最终状态只有一个确定结果。
 
 ## 重试与回滚规则
 
@@ -106,6 +124,50 @@ RUNNING --全部批次完成--> COMPLETED
   并发心跳收敛到最大时间戳、并发注册与心跳的一致性；
 - `RolloutServiceTest`：批次阈值边界（不足不推进/达标自动推进）、防跳批、
   重复上报不重复计数、失败率超限暂停且原因可追溯、重试恢复、回滚后版本唯一确定、
-  离线设备重连收敛、并发上报恰好计数一次。
+  离线设备重连收敛、并发上报恰好计数一次、**收尾批次门槛按实际批大小收敛后正常完成**、
+  **批内设备全部定性但成功台数不足时明确收尾为 FAILED（含“失败暂停后回滚”与
+  “未暂停直接回滚”两条路径）**、收尾批并发上报只完成一次、满批老配置放行语义不变。
 
 所有用例日志均打印**输入、判定依据与最终状态**，便于审计与排障。
+
+## 本地复现与验证
+
+### 自动化测试（推荐，稳定可重复）
+
+```bash
+mvn test                                  # 运行全部用例（共 19 个）
+mvn test -Dtest=RolloutServiceTest       # 只跑编排相关用例
+```
+
+两个此前“结束不了”的场景对应的用例：
+
+- `tailBatchSmallerThanThresholdConvergesAndCompletes`
+  复现“默认配置（每批 3 台、阈值 2）投 4 台，收尾批仅 1 台”——修复前任务永久 RUNNING，
+  修复后收尾批门槛收敛为 1，`d4` 上报成功后任务 `COMPLETED`；
+- `batchFailsWhenAllDevicesDecidedButSuccessBelowThreshold`（批内定性但成功不足，经“失败→暂停→回滚”路径）
+  与 `rollbackWhileRunningAlsoFinalizesWhenBatchExhausted`（同语义，经“未暂停直接回滚”路径）
+  ——修复前批内已无待处理设备却永远 RUNNING，修复后明确落 `FAILED` 终态，
+  `finishReason` 标明实际成功台数与门槛。
+
+### 手工 HTTP 复现
+
+```bash
+mvn spring-boot:run
+# 注册 4 台设备
+for d in d1 d2 d3 d4; do
+  curl -s -X POST "http://localhost:8080/api/devices/$d/register?version=1.0.0" >/dev/null
+done
+# 用默认配置（每批 3 台、阈值 2）创建任务
+curl -s -X POST "http://localhost:8080/api/rollout/tasks/demo?targetVersion=2.0.0&deviceIds=d1,d2,d3,d4"
+# 第 1 批 d1、d2 成功 -> 自动进入收尾批 [d4]
+curl -s -X POST "http://localhost:8080/api/rollout/tasks/demo/report?deviceId=d1&success=true"
+curl -s -X POST "http://localhost:8080/api/rollout/tasks/demo/report?deviceId=d2&success=true"
+# 收尾批 d4 成功 -> status=COMPLETED（修复前这里会永远停在 RUNNING）
+curl -s -X POST "http://localhost:8080/api/rollout/tasks/demo/report?deviceId=d4&success=true"
+curl -s "http://localhost:8080/api/rollout/tasks/demo"   # 查询：status 与 finishReason 一目了然
+```
+
+“批内全部定性但成功不足”的手工复现（3 台/批、阈值 2）：d1 成功，d2、d3 报失败后调用
+`/rollback-all-failed`；任务恢复后因批内为 1 SUCCESS + 2 ROLLED_BACK、成功台数 1 < 门槛 2，
+`GET /api/rollout/tasks/{taskId}` 返回 `"status":"FAILED"`，`finishReason` 形如
+`batch 0 exhausted: successCount=1 < requiredThreshold=2 (batchSize=3), all devices decided ...`。

@@ -268,4 +268,202 @@ class RolloutServiceTest {
         assertEquals(4, successCount);
         assertEquals(TaskStatus.COMPLETED, task.getStatus(), "4台全部成功且达标, 任务完成");
     }
+
+    /**
+     * 卡死场景一（设备数不是每批整数倍的收尾批次）：
+     * 默认配置 batchSize=3、successThreshold=2，投 4 台设备 -> 批次为 [d1,d2,d3] 与收尾批 [d4]。
+     * 收尾批只有 1 台，永远凑不满原阈值 2；修复前任务永久停在 RUNNING，
+     * 修复后门槛按本批实际台数收敛为 1，d4 成功即 COMPLETED。
+     */
+    @Test
+    void tailBatchSmallerThanThresholdConvergesAndCompletes() {
+        // 对齐 application.properties 的生产默认值：batch-size=3, batch-success-threshold=2
+        OtaProperties defaults = new OtaProperties();
+        defaults.setOfflineThresholdMs(1_000L);
+        defaults.setBatchSize(3);
+        defaults.setBatchSuccessThreshold(2);
+        DeviceRegistry registryWithDefaults = new DeviceRegistry(defaults);
+        RolloutService service = new RolloutService(registryWithDefaults, defaults);
+
+        registerDevicesInto("d", 4, registryWithDefaults);
+        // 使用配置默认值创建任务（3 台/批, 阈值 2），4 台 -> 2 批，收尾批仅 d4
+        UpgradeTask task = service.createTask("t-tail", "2.0.0", deviceIds("d", 4));
+        assertEquals(2, task.getBatchCount(), "4台按每批3台切分为2批");
+        assertEquals(0, task.getCurrentBatchIndex(), "初始当前批为第0批");
+
+        // 第1批 d1、d2 成功 -> 达到门槛 2，自动推进到收尾批（d3 尚未上报，沿用老规则不等待）
+        assertEquals(ReportOutcome.ACCEPTED_SUCCESS, service.reportSuccess("t-tail", "d1"));
+        assertEquals(ReportOutcome.ACCEPTED_SUCCESS, service.reportSuccess("t-tail", "d2"));
+        assertEquals(1, task.getCurrentBatchIndex(), "第1批达标后应进入收尾批");
+        assertEquals(TaskStatus.RUNNING, task.getStatus(), "收尾批未定性前任务保持进行中");
+
+        // 修复前：收尾批只有 d4 一台，成功数永远 < 阈值2，任务卡死在 RUNNING
+        ReportOutcome outcome = service.reportSuccess("t-tail", "d4");
+        log.info("[用例:收尾批次] 输入: 默认配置(批3台/阈值2)投4台, 收尾批仅d4, d4上报成功");
+        log.info("[用例:收尾批次] 判定依据: 收尾批实际台数1 -> 生效门槛min(2,1)=1, successCount(1)>=1 且全部定性 -> 完成");
+        log.info("[用例:收尾批次] 最终状态: outcome={}, taskStatus={}, finishReason={}",
+                outcome, task.getStatus(), task.getFinishReason());
+
+        assertEquals(ReportOutcome.ACCEPTED_SUCCESS, outcome);
+        assertEquals(TaskStatus.COMPLETED, task.getStatus(), "收尾批次按实际台数收敛门槛后必须能正常完成");
+        assertNotNull(task.getFinishReason(), "完成收尾需记录可查询的收尾依据");
+        // 终态后迟到上报被拒绝，终态不反复
+        assertEquals(ReportOutcome.REJECTED_TASK_FINISHED, service.reportSuccess("t-tail", "d4"));
+        assertEquals(TaskStatus.COMPLETED, task.getStatus());
+    }
+
+    /**
+     * 卡死场景二（一批设备全部定性但成功台数不够）：
+     * 3 台一批、阈值 2；d1 成功，d2、d3 失败后被回滚。
+     * 此时批内已无 PENDING/FAILED 设备（1 SUCCESS + 2 ROLLED_BACK），
+     * 成功台数 1 < 2 且不可能再变化。修复前任务永久停在 RUNNING；
+     * 修复后明确收尾为 FAILED 终态，finishReason 可追溯。
+     */
+    @Test
+    void batchFailsWhenAllDevicesDecidedButSuccessBelowThreshold() {
+        registerDevices("m", 3);
+        // 默认失败率 0.5：2 台失败时失败率 2/3≈0.67 > 0.5 -> 会先暂停；
+        // 回滚全部失败设备后恢复，此时批内全部定性而成功不足 -> 必须失败收尾
+        UpgradeTask task = rolloutService.createTask("t-exhausted", "2.0.0", deviceIds("m", 3),
+                3, 2, 0.5d);
+
+        assertEquals(ReportOutcome.ACCEPTED_SUCCESS, rolloutService.reportSuccess("t-exhausted", "m1"));
+        assertEquals(ReportOutcome.ACCEPTED_FAILURE, rolloutService.reportFailure("t-exhausted", "m2", "flash-error"));
+        // 1/2 失败率 = 0.5，未超过 0.5，仍运行
+        assertEquals(TaskStatus.RUNNING, task.getStatus());
+        assertEquals(ReportOutcome.ACCEPTED_FAILURE, rolloutService.reportFailure("t-exhausted", "m3", "power-loss"));
+        assertEquals(TaskStatus.PAUSED, task.getStatus(), "2/3 失败率超过 0.5, 任务暂停");
+
+        // 两台失败设备全部回滚 -> 失败记录消解, 任务恢复并立即重新收尾判定
+        int rolledBack = rolloutService.rollbackAllFailed("t-exhausted");
+        log.info("[用例:批内定性失败] 输入: 3台/批阈值2, m1成功, m2/m3失败后全部回滚");
+        log.info("[用例:批内定性失败] 判定依据: 批内全部定性(SUCCESS/ROLLED_BACK), successCount(1) < threshold(2), 不可能再变化 -> FAILED");
+        log.info("[用例:批内定性失败] 最终状态: rolledBack={}, taskStatus={}, finishReason={}",
+                rolledBack, task.getStatus(), task.getFinishReason());
+
+        assertEquals(2, rolledBack);
+        assertEquals(DeviceUpgradeState.ROLLED_BACK, task.findRecord("m2").getState());
+        assertEquals(DeviceUpgradeState.ROLLED_BACK, task.findRecord("m3").getState());
+        assertEquals(TaskStatus.FAILED, task.getStatus(),
+                "批内设备已全部定性但成功台数不足时, 任务必须落到明确的失败终态, 不得永久 RUNNING");
+        assertNotNull(task.getFinishReason(), "失败收尾原因需可追溯");
+        assertTrue(task.getFinishReason().contains("successCount=1"), "收尾原因需体现实际成功台数");
+
+        // 终态确定且不可逆：显式推进无效、迟到上报被拒绝、状态不再来回跳
+        assertFalse(rolloutService.advanceBatch("t-exhausted"));
+        assertEquals(ReportOutcome.REJECTED_TASK_FINISHED,
+                rolloutService.reportSuccess("t-exhausted", "m2"));
+        assertEquals(TaskStatus.FAILED, task.getStatus());
+    }
+
+    /**
+     * 收尾批次的并发确定性：收尾批唯一设备 d4 被多线程并发重复上报成功，
+     * 只能被接受一次，任务恰好完成一次，终态唯一确定，不出现反复。
+     */
+    @Test
+    void concurrentReportsOnTailBatchCompleteExactlyOnce() throws Exception {
+        registerDevices("n", 4);
+        UpgradeTask task = rolloutService.createTask("t-tail-concurrent", "2.0.0", deviceIds("n", 4),
+                3, 2, 0.5d);
+        rolloutService.reportSuccess("t-tail-concurrent", "n1");
+        rolloutService.reportSuccess("t-tail-concurrent", "n2");
+        assertEquals(1, task.getCurrentBatchIndex());
+
+        int threads = 12;
+        int repeats = 50;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicInteger rejectedFinished = new AtomicInteger();
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int j = 0; j < repeats; j++) {
+                        ReportOutcome outcome = rolloutService.reportSuccess("t-tail-concurrent", "n4");
+                        if (outcome == ReportOutcome.ACCEPTED_SUCCESS) {
+                            accepted.incrementAndGet();
+                        } else if (outcome == ReportOutcome.REJECTED_TASK_FINISHED
+                                || outcome == ReportOutcome.DUPLICATE_IGNORED) {
+                            rejectedFinished.incrementAndGet();
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }));
+        }
+        start.countDown();
+        for (Future<?> f : futures) {
+            f.get(30, TimeUnit.SECONDS);
+        }
+        pool.shutdown();
+
+        log.info("[用例:收尾批并发] 输入: {}线程并发重复上报收尾批唯一设备n4, 每线程{}次", threads, repeats);
+        log.info("[用例:收尾批并发] 判定依据: 任务锁串行化 + 终态幂等 -> n4只接受一次, 任务完成一次");
+        log.info("[用例:收尾批并发] 最终状态: accepted={}, 其余忽略/拒绝={}, taskStatus={}",
+                accepted.get(), rejectedFinished.get(), task.getStatus());
+
+        assertEquals(1, accepted.get(), "收尾批设备的并发重复上报只能接受一次");
+        assertEquals(TaskStatus.COMPLETED, task.getStatus(), "收尾批在并发上报下仍唯一确定地完成");
+    }
+
+    /**
+     * 满批 + 未失败时沿用原放行语义：批大小等于阈值的老配置任务，
+     * 必须整批全部成功才完成（门槛未被收尾批规则放宽）。
+     */
+    @Test
+    void fullBatchKeepsOriginalGateSemantics() {
+        registerDevices("p", 3);
+        UpgradeTask task = rolloutService.createTask("t-full", "2.0.0", deviceIds("p", 3),
+                3, 3, 1.0d);
+
+        rolloutService.reportSuccess("t-full", "p1");
+        rolloutService.reportSuccess("t-full", "p2");
+        assertEquals(TaskStatus.RUNNING, task.getStatus(), "满批阈值3, 仅2台成功不得完成");
+        assertFalse(rolloutService.advanceBatch("t-full"), "显式推进同样不得放行");
+        assertEquals(3, task.effectiveSuccessThreshold(), "满批生效门槛等于原阈值");
+
+        rolloutService.reportSuccess("t-full", "p3");
+        log.info("[用例:满批老语义] 输入: 3台/批阈值3, 三台全部成功");
+        log.info("[用例:满批老语义] 判定依据: 满批门槛仍为3, successCount(3)>=3 且全部定性 -> 完成");
+        log.info("[用例:满批老语义] 最终状态: taskStatus={}", task.getStatus());
+        assertEquals(TaskStatus.COMPLETED, task.getStatus(), "满批老配置的完成语义保持不变");
+    }
+
+    /**
+     * 变体：失败率未超限（任务未暂停）时直接回滚失败设备，批内同样会全部定性。
+     * 3 台/批、阈值 3、maxFailureRate=1.0：m1 成功，m2、m3 失败后回滚，
+     * 任务从未 PAUSED；修复前回滚不触发收尾，任务卡在 RUNNING。
+     */
+    @Test
+    void rollbackWhileRunningAlsoFinalizesWhenBatchExhausted() {
+        registerDevices("q", 3);
+        UpgradeTask task = rolloutService.createTask("t-rollback-running", "2.0.0", deviceIds("q", 3),
+                3, 3, 1.0d);
+
+        rolloutService.reportSuccess("t-rollback-running", "q1");
+        rolloutService.reportFailure("t-rollback-running", "q2", "flash-error");
+        rolloutService.reportFailure("t-rollback-running", "q3", "power-loss");
+        assertEquals(TaskStatus.RUNNING, task.getStatus(), "maxFailureRate=1.0, 失败率不超限, 不暂停");
+
+        assertTrue(rolloutService.rollbackDevice("t-rollback-running", "q2"));
+        assertEquals(TaskStatus.RUNNING, task.getStatus(), "尚有q3为FAILED未决, 任务继续等待");
+        assertTrue(rolloutService.rollbackDevice("t-rollback-running", "q3"));
+
+        log.info("[用例:运行中回滚收尾] 输入: 未暂停, q1成功, q2/q3先后回滚");
+        log.info("[用例:运行中回滚收尾] 判定依据: q3回滚后批内全部定性(1 SUCCESS+2 ROLLED_BACK), successCount(1)<3 -> FAILED");
+        log.info("[用例:运行中回滚收尾] 最终状态: taskStatus={}, finishReason={}",
+                task.getStatus(), task.getFinishReason());
+
+        assertEquals(TaskStatus.FAILED, task.getStatus(),
+                "未暂停路径下回滚导致批内全部定性且成功不足时, 也必须明确失败收尾");
+    }
+
+    private void registerDevicesInto(String prefix, int count, DeviceRegistry targetRegistry) {
+        for (int i = 1; i <= count; i++) {
+            targetRegistry.register(prefix + i, "1.0.0", T0);
+        }
+    }
 }
