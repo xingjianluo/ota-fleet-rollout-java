@@ -102,6 +102,7 @@ public class RolloutController {
         view.put("currentBatchIndex", task.getCurrentBatchIndex());
         view.put("batchCount", task.getBatchCount());
         view.put("pauseReason", task.getPauseReason());
+        view.put("failureReason", task.getFailureReason());
         List<Map<String, Object>> batches = new ArrayList<>();
         task.getBatches().forEach(batch -> {
             Map<String, Object> batchView = new LinkedHashMap<>();

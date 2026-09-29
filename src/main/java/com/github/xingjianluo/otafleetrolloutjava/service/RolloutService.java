@@ -172,17 +172,20 @@ public class RolloutService {
     }
 
     /**
-     * 显式推进批次（与自动推进同一判定：当前批成功数达到阈值才允许进入下一批）。
+     * 显式推进批次（与自动推进同一判定：当前批成功数达到有效阈值才允许进入下一批；
+     * 当前批已全部定性但成功台数不足则任务失败收尾）。
      *
-     * @return true 表示批次发生推进或任务完成
+     * @return true 表示批次发生推进，或任务进入 COMPLETED/FAILED 终态
      */
     public boolean advanceBatch(String taskId) {
         boolean[] advanced = new boolean[1];
         tasks.computeIfPresent(taskId, (id, task) -> {
             advanced[0] = task.advanceBatch();
-            log.info("[advance] taskId={}, 判定依据: currentBatchSuccess={} >= threshold={} -> {}, 任务状态={}",
-                    id, task.currentBatchSuccessCount(), task.getSuccessThreshold(),
-                    advanced[0] ? "推进" : "保持", task.getStatus());
+            log.info("[advance] taskId={}, 判定依据: currentBatchSuccess={} >= effectiveThreshold={}"
+                            + "(配置阈值={}, 本批台数={}) -> {}, 任务状态={}",
+                    id, task.currentBatchSuccessCount(), task.currentBatchEffectiveThreshold(),
+                    task.getSuccessThreshold(), task.currentBatchSize(),
+                    advanced[0] ? "推进/收尾" : "保持", task.getStatus());
             return task;
         });
         return advanced[0];
@@ -200,7 +203,7 @@ public class RolloutService {
                 retried[0] = true;
                 log.info("[retry] 失败设备重置为PENDING: taskId={}, deviceId={}, attempts={}",
                         id, deviceId, record.getAttempts());
-                resumeIfResolved(task);
+                settleAfterResolution(task);
             } else {
                 log.info("[retry] 无需重试(非FAILED状态): taskId={}, deviceId={}, 状态={}",
                         id, deviceId, record == null ? "无记录" : record.getState());
@@ -223,7 +226,7 @@ public class RolloutService {
                 rolledBack[0] = true;
                 log.info("[rollback] 设备回滚: taskId={}, deviceId={}, 生效版本恢复为 {}",
                         id, deviceId, record.getPreviousVersion());
-                resumeIfResolved(task);
+                settleAfterResolution(task);
             } else {
                 log.info("[rollback] 无需回滚(非FAILED状态): taskId={}, deviceId={}, 状态={}",
                         id, deviceId, record == null ? "无记录" : record.getState());
@@ -247,7 +250,7 @@ public class RolloutService {
                     }
                 }
             }
-            resumeIfResolved(task);
+            settleAfterResolution(task);
             return task;
         });
         return count[0];
@@ -285,28 +288,48 @@ public class RolloutService {
         return Optional.ofNullable(tasks.get(taskId));
     }
 
-    /** 上报/状态变更后的统一收尾：失败率超限则暂停，否则按阈值自动推进。 */
+    /** 上报/状态变更后的统一收尾：失败率超限则暂停，否则按有效阈值推进或失败收尾。 */
     private void settle(String taskId, UpgradeTask task) {
         if (task.pauseIfFailureRateExceeded()) {
             log.warn("[settle] 失败率超限, 任务暂停: taskId={}, 原因={}", taskId, task.getPauseReason());
             return;
         }
-        if (task.advanceBatch()) {
+        if (!task.advanceBatch()) {
+            return;
+        }
+        if (task.getStatus() == TaskStatus.FAILED) {
+            log.warn("[settle] 当前批设备已全部定性但成功台数不足, 任务失败收尾: taskId={}, 原因={}",
+                    taskId, task.getFailureReason());
+        } else if (task.getStatus() == TaskStatus.COMPLETED) {
+            log.info("[settle] 末批达标且全部定性, 任务完成: taskId={}, 当前批次={}/{}",
+                    taskId, task.getCurrentBatchIndex() + 1, task.getBatchCount());
+        } else {
             log.info("[settle] 批次推进: taskId={}, 当前批次={}/{}, 任务状态={}",
                     taskId, task.getCurrentBatchIndex() + 1, task.getBatchCount(), task.getStatus());
         }
     }
 
-    /** 失败记录全部消解（重试/回滚）后自动恢复暂停的任务。 */
-    private void resumeIfResolved(UpgradeTask task) {
-        if (task.getStatus() != TaskStatus.PAUSED) {
-            return;
+    /**
+     * 失败记录消解（重试/回滚）后的统一收敛：
+     * <ul>
+     *   <li>任务处于 PAUSED：失败记录全部消解后恢复 RUNNING，并立即重新收尾
+     *      （可能直接进入 COMPLETED/FAILED，不能停在 RUNNING 空等）；</li>
+     *   <li>任务处于 RUNNING（失败率未超限，未暂停过）：同样重新收尾——
+     *      例如末批/收尾批次中最后一个 FAILED 被回滚后，批次可能已全部定性，
+     *      此时应 COMPLETED 或 FAILED 收尾。</li>
+     * </ul>
+     */
+    private void settleAfterResolution(UpgradeTask task) {
+        if (task.getStatus() == TaskStatus.PAUSED) {
+            boolean anyFailed = task.getBatches().stream()
+                    .flatMap(b -> b.values().stream())
+                    .anyMatch(r -> r.getState() == DeviceUpgradeState.FAILED);
+            if (!anyFailed && task.resume()) {
+                log.info("[resume] 失败记录已消解, 任务恢复: taskId={}", task.getTaskId());
+            }
         }
-        boolean anyFailed = task.getBatches().stream()
-                .flatMap(b -> b.values().stream())
-                .anyMatch(r -> r.getState() == DeviceUpgradeState.FAILED);
-        if (!anyFailed && task.resume()) {
-            log.info("[resume] 失败记录已消解, 任务恢复: taskId={}", task.getTaskId());
+        if (task.getStatus() == TaskStatus.RUNNING) {
+            settle(task.getTaskId(), task);
         }
     }
 
